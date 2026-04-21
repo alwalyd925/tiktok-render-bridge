@@ -7,7 +7,7 @@ from html import escape
 
 from flask import Flask, jsonify, request, Response
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import ConnectEvent, DisconnectEvent, FollowEvent, GiftEvent, LikeEvent
+from TikTokLive.events import ConnectEvent, DisconnectEvent, FollowEvent, GiftEvent, LikeEvent, CommentEvent
 
 SHARED_SECRET = os.getenv('SHARED_SECRET', 'CHANGE_ME')
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', '1800'))
@@ -63,6 +63,24 @@ def push_event(streamer_id: str, payload: dict):
             session['last_activity'] = now_ts()
 
 
+def event_display_name(event) -> str:
+    user = getattr(event, 'user', None)
+    return (
+        getattr(user, 'nickname', None)
+        or getattr(user, 'unique_id', None)
+        or 'TikTok User'
+    )
+
+
+def event_user_key(event) -> str:
+    user = getattr(event, 'user', None)
+    return (
+        getattr(user, 'unique_id', None)
+        or getattr(user, 'nickname', None)
+        or 'tiktok_user'
+    )
+
+
 class StreamClientState:
     def __init__(self, streamer_id: str):
         self.streamer_id = streamer_id
@@ -94,13 +112,19 @@ class StreamClientState:
         @client.on(GiftEvent)
         async def _on_gift(event: GiftEvent):
             self.last_activity = now_ts()
-            repeat_count = getattr(event.gift, 'repeat_count', 1) or 1
+            repeat_count = int(getattr(event.gift, 'repeat_count', 1) or 1)
+            diamond_count = int(getattr(event.gift, 'diamond_count', 0) or 0)
+            coin_count = diamond_count * repeat_count
+            if coin_count <= 0:
+                coin_count = max(1, repeat_count)
             push_event(streamer_id, {
                 'type': 'gift',
                 'streamerId': streamer_id,
-                'username': getattr(event.user, 'nickname', 'TikTok User'),
+                'username': event_display_name(event),
+                'userKey': event_user_key(event),
                 'giftName': getattr(event.gift, 'name', 'Gift'),
-                'repeatCount': int(repeat_count),
+                'repeatCount': repeat_count,
+                'coinCount': int(coin_count),
             })
 
         @client.on(LikeEvent)
@@ -109,8 +133,20 @@ class StreamClientState:
             push_event(streamer_id, {
                 'type': 'like',
                 'streamerId': streamer_id,
-                'username': getattr(event.user, 'nickname', 'TikTok User'),
+                'username': event_display_name(event),
+                'userKey': event_user_key(event),
                 'likeCount': int(getattr(event, 'count', 1) or 1),
+            })
+
+        @client.on(CommentEvent)
+        async def _on_comment(event: CommentEvent):
+            self.last_activity = now_ts()
+            push_event(streamer_id, {
+                'type': 'comment',
+                'streamerId': streamer_id,
+                'username': event_display_name(event),
+                'userKey': event_user_key(event),
+                'comment': str(getattr(event, 'comment', '') or ''),
             })
 
         @client.on(FollowEvent)
@@ -119,7 +155,8 @@ class StreamClientState:
             push_event(streamer_id, {
                 'type': 'follow',
                 'streamerId': streamer_id,
-                'username': getattr(event.user, 'nickname', 'TikTok User'),
+                'username': event_display_name(event),
+                'userKey': event_user_key(event),
             })
 
     def _run_forever(self):
@@ -230,7 +267,7 @@ PAIR_HTML = """<!doctype html>
         <li>Pair the same room code to your TikTok username.</li>
         <li>Back in Roblox, press <code>Connect</code>.</li>
       </ol>
-      <div class='small'>This demo stores pairings in memory on Render. If the free instance sleeps or redeploys, pair again.</div>
+      <div class='small'>This demo stores pairings in memory on Render. If the instance sleeps or redeploys, pair again.</div>
     </div>
   </div>
 </body>
