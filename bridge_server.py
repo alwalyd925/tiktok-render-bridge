@@ -1,452 +1,385 @@
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+import os
+import time
+import uuid
+import threading
+import re
+from collections import deque
+from typing import Dict, Deque, Any
 
-local BRIDGE_BASE_URL = "https://YOUR-RENDER-SERVICE.onrender.com"
-local SHARED_SECRET = "CHANGE_ME"
-local DEFAULT_ROUND_DURATION = 60
-local POLL_INTERVAL_SECONDS = 1
+from flask import Flask, request, jsonify, Response
 
-local remotesFolder = ReplicatedStorage:FindFirstChild("TikTokBridgeRemotes") or Instance.new("Folder")
-remotesFolder.Name = "TikTokBridgeRemotes"
-remotesFolder.Parent = ReplicatedStorage
+PAIR_HTML = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pair TikTok Live to Roblox</title>
+<style>
+body{font-family:Arial,sans-serif;background:#070b16;color:#fff;display:flex;justify-content:center;padding:40px}
+.card{width:min(92vw,520px);background:#0f1629;border:1px solid #27314d;border-radius:18px;padding:24px}
+h1{margin:0 0 18px;font-size:22px}
+label{display:block;margin:14px 0 6px;font-weight:700}
+input{width:100%;padding:14px;border-radius:12px;border:1px solid #2c395e;background:#091025;color:#fff}
+button{width:100%;padding:14px;border:0;border-radius:12px;background:#6d5efc;color:#fff;font-weight:700;margin-top:18px;cursor:pointer}
+.note{margin-top:18px;color:#cfe0ff;background:#0b1733;padding:14px;border-radius:12px}
+.ok{background:#0f4023;color:#d9ffe6;padding:12px;border-radius:12px;margin-top:14px}
+.err{background:#4a1a1a;color:#ffdede;padding:12px;border-radius:12px;margin-top:14px}
+small{opacity:.75}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Pair TikTok Live to Roblox</h1>
+    <div>Enter the room code shown inside the Roblox game, then enter the TikTok live username to connect this room to that live.</div>
+    {message_block}
+    <form method="post" action="/pair">
+      <label>Room code</label>
+      <input name="room" value="{room}" placeholder="1234">
+      <label>TikTok username</label>
+      <input name="username" value="{username}" placeholder="sp200921">
+      <button type="submit">Pair now</button>
+    </form>
+    <div class="note">
+      <div><strong>How to use:</strong></div>
+      <ol>
+        <li>Open the game and enter a room code.</li>
+        <li>Open this page on your phone.</li>
+        <li>Pair the same room code to your TikTok username.</li>
+        <li>Back in Roblox, press <code>Connect</code>.</li>
+      </ol>
+      <small>This build prints logs for comments, likes, gifts, and follows.</small>
+    </div>
+  </div>
+</body>
+</html>
+"""
 
-local controlFunction = remotesFolder:FindFirstChild("Control") or Instance.new("RemoteFunction")
-controlFunction.Name = "Control"
-controlFunction.Parent = remotesFolder
+SHARED_SECRET = os.getenv("SHARED_SECRET", "")
+PORT = int(os.getenv("PORT", "10000"))
 
-local toastEvent = remotesFolder:FindFirstChild("Toast") or Instance.new("RemoteEvent")
-toastEvent.Name = "Toast"
-toastEvent.Parent = remotesFolder
+app = Flask(__name__)
 
-local stateFolder = ReplicatedStorage:FindFirstChild("TikTokBridgeState") or Instance.new("Folder")
-stateFolder.Name = "TikTokBridgeState"
-stateFolder.Parent = ReplicatedStorage
+pairings: Dict[str, Dict[str, Any]] = {}
+sessions: Dict[str, Dict[str, Any]] = {}
+listeners: Dict[str, Dict[str, Any]] = {}
+lock = threading.RLock()
 
-local function ensureValue(className, name, defaultValue)
-    local existing = stateFolder:FindFirstChild(name)
-    if existing and existing.ClassName == className then
-        return existing
-    end
 
-    if existing then
-        existing:Destroy()
-    end
+def log(msg: str):
+    print(f"[DEBUG] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
-    local value = Instance.new(className)
-    value.Name = name
-    value.Value = defaultValue
-    value.Parent = stateFolder
+
+def normalize_room(value: str) -> str:
+    value = str(value or "").strip().upper()
+    value = re.sub(r"[^A-Z0-9_-]", "", value)
+    return value[:32]
+
+
+def normalize_username(value: str) -> str:
+    value = str(value or "").strip().lstrip("@")
     return value
-end
 
-local linkedStreamerValue = ensureValue("StringValue", "LinkedStreamer", "")
-local roomCodeValue = ensureValue("StringValue", "RoomCode", "")
-local sessionKeyValue = ensureValue("StringValue", "SessionKey", "")
-local bridgeStatusValue = ensureValue("StringValue", "BridgeStatus", "Idle")
-local roundDurationValue = ensureValue("IntValue", "RoundDurationSeconds", DEFAULT_ROUND_DURATION)
-local roundRemainingValue = ensureValue("IntValue", "RoundRemainingSeconds", DEFAULT_ROUND_DURATION)
-local roundRunningValue = ensureValue("BoolValue", "IsRoundRunning", false)
-local lastEventValue = ensureValue("StringValue", "LastEventText", "No events yet")
-local totalLikesValue = ensureValue("IntValue", "TotalLikes", 0)
-local pairUrlValue = ensureValue("StringValue", "PairUrl", BRIDGE_BASE_URL .. "/pair")
 
-local currentSessionKey = nil
-local currentStreamerId = nil
-local currentRoomCode = nil
-local roundLoopToken = 0
+def render_pair_html(message_block: str, room: str, username: str) -> str:
+    return (PAIR_HTML
+            .replace("{message_block}", message_block)
+            .replace("{room}", room)
+            .replace("{username}", username))
 
-local function normalizeRoomCode(value)
-    value = tostring(value or "")
-    value = string.upper(value)
-    value = string.gsub(value, "[^%w_-]", "")
-    return string.sub(value, 1, 32)
-end
 
-local function pushToast(targetPlayer, text, kind)
-    if targetPlayer then
-        toastEvent:FireClient(targetPlayer, text, kind or "info")
-    else
-        toastEvent:FireAllClients(text, kind or "info")
-    end
-end
+def broadcast(streamer_id: str, event: Dict[str, Any]):
+    with lock:
+        delivered = 0
+        for session in sessions.values():
+            if session.get("streamerId") == streamer_id:
+                q: Deque[dict] = session["queue"]
+                q.append(event)
+                delivered += 1
+    log(f"broadcast streamer=@{streamer_id} event={event.get('type')} delivered={delivered} payload={event}")
 
-local function updateBridgeState(status)
-    bridgeStatusValue.Value = status
-end
 
-local function snapshotState(player)
-    return {
-        ok = true,
-        isController = player and (player.UserId == game.CreatorId or (game.PrivateServerOwnerId ~= 0 and player.UserId == game.PrivateServerOwnerId) or (RunService:IsStudio() and player == Players:GetPlayers()[1])) or false,
-        linkedStreamer = linkedStreamerValue.Value,
-        roomCode = roomCodeValue.Value,
-        bridgeStatus = bridgeStatusValue.Value,
-        roundDurationSeconds = roundDurationValue.Value,
-        roundRemainingSeconds = roundRemainingValue.Value,
-        isRoundRunning = roundRunningValue.Value,
-        totalLikes = totalLikesValue.Value,
-        lastEventText = lastEventValue.Value,
-        pairUrl = pairUrlValue.Value,
-    }
-end
+def require_secret() -> bool:
+    if not SHARED_SECRET:
+        return True
+    return request.headers.get("x-bridge-secret", "") == SHARED_SECRET
 
-local function requestJson(path, body, method)
-    local response = HttpService:RequestAsync({
-        Url = BRIDGE_BASE_URL .. path,
-        Method = method or "POST",
-        Headers = {
-            ["Content-Type"] = "application/json",
-            ["x-bridge-secret"] = SHARED_SECRET,
-        },
-        Body = body and HttpService:JSONEncode(body) or "",
+
+def start_listener_if_needed(streamer_id: str):
+    streamer_id = normalize_username(streamer_id)
+    if not streamer_id:
+        return False
+
+    with lock:
+        existing = listeners.get(streamer_id)
+        if existing and existing.get("active"):
+            log(f"listener already active for @{streamer_id}")
+            return True
+
+    def runner():
+        try:
+            log(f"starting TikTok listener for @{streamer_id}")
+            from TikTokLive import TikTokLiveClient
+
+            client = TikTokLiveClient(unique_id=f"@{streamer_id}")
+
+            @client.on("connect")
+            async def _on_connect(event):
+                with lock:
+                    listeners[streamer_id] = {
+                        "active": True,
+                        "startedAt": time.time(),
+                        "error": None,
+                    }
+                log(f"TikTok CONNECTED for @{streamer_id}")
+                broadcast(streamer_id, {"type": "status", "state": "connected"})
+
+            @client.on("disconnect")
+            async def _on_disconnect(event):
+                with lock:
+                    item = listeners.get(streamer_id, {})
+                    item["active"] = False
+                    listeners[streamer_id] = item
+                log(f"TikTok DISCONNECTED for @{streamer_id}")
+                broadcast(streamer_id, {"type": "status", "state": "disconnected"})
+
+            @client.on("live_end")
+            async def _on_live_end(event):
+                log(f"TikTok LIVE ENDED for @{streamer_id}")
+                broadcast(streamer_id, {"type": "status", "state": "ended"})
+
+            @client.on("comment")
+            async def _on_comment(event):
+                user = getattr(event, "user", None)
+                username = getattr(user, "unique_id", None) or getattr(user, "nickname", None) or "unknown"
+                text = getattr(event, "comment", "") or ""
+                payload = {
+                    "type": "comment",
+                    "username": str(username),
+                    "text": str(text),
+                }
+                log(f"COMMENT @{streamer_id} from={username} text={text!r}")
+                broadcast(streamer_id, payload)
+
+            @client.on("like")
+            async def _on_like(event):
+                user = getattr(event, "user", None)
+                username = getattr(user, "unique_id", None) or getattr(user, "nickname", None) or "unknown"
+                like_count = (getattr(event, "count", None)
+                              or getattr(event, "likeCount", None)
+                              or getattr(event, "likes", None)
+                              or 1)
+                try:
+                    like_count = int(like_count)
+                except Exception:
+                    like_count = 1
+                payload = {
+                    "type": "like",
+                    "username": str(username),
+                    "likeCount": like_count,
+                }
+                log(f"LIKE @{streamer_id} from={username} count={like_count}")
+                broadcast(streamer_id, payload)
+
+            @client.on("follow")
+            async def _on_follow(event):
+                user = getattr(event, "user", None)
+                username = getattr(user, "unique_id", None) or getattr(user, "nickname", None) or "unknown"
+                payload = {"type": "follow", "username": str(username)}
+                log(f"FOLLOW @{streamer_id} from={username}")
+                broadcast(streamer_id, payload)
+
+            @client.on("gift")
+            async def _on_gift(event):
+                user = getattr(event, "user", None)
+                username = getattr(user, "unique_id", None) or getattr(user, "nickname", None) or "unknown"
+                gift = getattr(event, "gift", None)
+                gift_name = (
+                    getattr(getattr(gift, "info", None), "name", None)
+                    or getattr(gift, "name", None)
+                    or getattr(event, "gift_name", None)
+                    or "Gift"
+                )
+                repeat_count = (getattr(gift, "count", None)
+                                or getattr(event, "repeat_count", None)
+                                or getattr(event, "repeatCount", None)
+                                or 1)
+                try:
+                    repeat_count = int(repeat_count)
+                except Exception:
+                    repeat_count = 1
+
+                coin_count = (
+                    getattr(getattr(gift, "info", None), "diamond_count", None)
+                    or getattr(gift, "diamond_count", None)
+                    or getattr(event, "diamond_count", None)
+                    or getattr(event, "diamondCount", None)
+                    or 1
+                )
+                try:
+                    coin_count = int(coin_count)
+                except Exception:
+                    coin_count = 1
+
+                payload = {
+                    "type": "gift",
+                    "username": str(username),
+                    "giftName": str(gift_name),
+                    "repeatCount": repeat_count,
+                    "coinCount": coin_count,
+                }
+                log(f"GIFT @{streamer_id} from={username} gift={gift_name} repeat={repeat_count} coinCount={coin_count}")
+                broadcast(streamer_id, payload)
+
+            @client.on("error")
+            async def _on_error(error):
+                log(f"TikTok ERROR for @{streamer_id}: {error}")
+
+            @client.on("unknown")
+            async def _on_unknown(event):
+                try:
+                    event_type = getattr(event, "type", None) or type(event).__name__
+                except Exception:
+                    event_type = "unknown"
+                log(f"UNKNOWN EVENT @{streamer_id}: {event_type}")
+
+            client.run()
+        except Exception as e:
+            with lock:
+                listeners[streamer_id] = {
+                    "active": False,
+                    "startedAt": time.time(),
+                    "error": str(e),
+                }
+            log(f"LISTENER ERROR for @{streamer_id}: {e}")
+
+    thread = threading.Thread(target=runner, name=f"tt-{streamer_id}", daemon=True)
+    with lock:
+        listeners[streamer_id] = {
+            "active": False,
+            "startedAt": time.time(),
+            "error": None,
+            "thread": thread.name,
+        }
+    thread.start()
+    return True
+
+
+@app.get("/healthz")
+def healthz():
+    with lock:
+        data = {
+            "ok": True,
+            "activeSessions": len(sessions),
+            "pairedRooms": len(pairings),
+            "activeStreamers": sum(1 for v in listeners.values() if v.get("active")),
+            "listeners": {k: {"active": v.get("active"), "error": v.get("error")} for k, v in listeners.items()},
+        }
+    return jsonify(data)
+
+
+@app.route("/pair", methods=["GET", "POST"])
+def pair():
+    if request.method == "GET":
+        room = normalize_room(request.args.get("room", ""))
+        html = render_pair_html("", room, "")
+        return Response(html, mimetype="text/html")
+
+    room = normalize_room(request.form.get("room", "") or (request.json or {}).get("room", ""))
+    username = normalize_username(request.form.get("username", "") or (request.json or {}).get("username", ""))
+
+    if not room or not username:
+        msg = '<div class="err">Room code and TikTok username are required.</div>'
+        html = render_pair_html(msg, room, username)
+        return Response(html, mimetype="text/html", status=400)
+
+    with lock:
+        pairings[room] = {"username": username, "pairedAt": time.time()}
+    log(f"PAIR room={room} username=@{username}")
+
+    msg = f'<div class="ok">Room {room} is now paired to @{username}. Go back to Roblox and press Connect.</div>'
+    html = render_pair_html(msg, room, username)
+    return Response(html, mimetype="text/html")
+
+
+@app.post("/session/start")
+def session_start():
+    if not require_secret():
+        return jsonify({"ok": False, "message": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    room = normalize_room(body.get("roomCode", ""))
+    if not room:
+        return jsonify({"ok": False, "message": "roomCode required"}), 400
+
+    with lock:
+        pairing = pairings.get(room)
+
+    if not pairing:
+        return jsonify({"ok": False, "message": "room not paired yet"}), 404
+
+    streamer_id = normalize_username(pairing["username"])
+    session_key = uuid.uuid4().hex
+
+    with lock:
+        sessions[session_key] = {
+            "roomCode": room,
+            "streamerId": streamer_id,
+            "queue": deque(maxlen=400),
+            "createdAt": time.time(),
+        }
+
+    start_listener_if_needed(streamer_id)
+    log(f"SESSION CREATED key={session_key[:8]} room={room} streamer=@{streamer_id}")
+
+    return jsonify({
+        "ok": True,
+        "sessionKey": session_key,
+        "roomCode": room,
+        "streamerId": streamer_id,
     })
 
-    if not response.Success then
-        error(string.format("HTTP %s %s", tostring(response.StatusCode), tostring(response.Body)))
-    end
 
-    return HttpService:JSONDecode(response.Body)
-end
+@app.post("/session/stop")
+def session_stop():
+    if not require_secret():
+        return jsonify({"ok": False, "message": "unauthorized"}), 401
 
-local function canControl(player)
-    if not player then
-        return false
-    end
+    body = request.get_json(silent=True) or {}
+    session_key = str(body.get("sessionKey", ""))
 
-    if player.UserId == game.CreatorId then
-        return true
-    end
+    with lock:
+        removed = sessions.pop(session_key, None)
 
-    if game.PrivateServerOwnerId and game.PrivateServerOwnerId ~= 0 and player.UserId == game.PrivateServerOwnerId then
-        return true
-    end
-
-    if RunService:IsStudio() then
-        return player == Players:GetPlayers()[1]
-    end
-
-    return false
-end
-
-local function stopCurrentSession()
-    if currentSessionKey then
-        pcall(function()
-            requestJson("/session/stop", {
-                sessionKey = currentSessionKey,
-                roomCode = currentRoomCode,
-            })
-        end)
-    end
-
-    currentSessionKey = nil
-    currentStreamerId = nil
-    currentRoomCode = nil
-    linkedStreamerValue.Value = ""
-    roomCodeValue.Value = ""
-    sessionKeyValue.Value = ""
-    updateBridgeState("Disconnected")
-end
-
-local function startSessionForRoom(roomCode)
-    roomCode = normalizeRoomCode(roomCode)
-
-    if roomCode == "" then
-        return false, "Room code is required"
-    end
-
-    currentRoomCode = roomCode
-    roomCodeValue.Value = roomCode
-    pairUrlValue.Value = BRIDGE_BASE_URL .. "/pair?room=" .. roomCode
-
-    stopCurrentSession()
-    currentRoomCode = roomCode
-    roomCodeValue.Value = roomCode
-    pairUrlValue.Value = BRIDGE_BASE_URL .. "/pair?room=" .. roomCode
-
-    local ok, result = pcall(function()
-        return requestJson("/session/start", {
-            roomCode = roomCode,
-            placeId = game.PlaceId,
-            jobId = game.JobId,
-        })
-    end)
-
-    if not ok then
-        updateBridgeState("Waiting for pairing")
-        local pairUrl = BRIDGE_BASE_URL .. "/pair?room=" .. roomCode
-        pairUrlValue.Value = pairUrl
-        lastEventValue.Value = "Pair this room on your phone: " .. pairUrl
-        return false, tostring(result)
-    end
-
-    if not result or not result.sessionKey then
-        updateBridgeState("Connect failed")
-        return false, "invalid response from bridge"
-    end
-
-    currentSessionKey = result.sessionKey
-    currentStreamerId = result.streamerId or ""
-    currentRoomCode = result.roomCode or roomCode
-
-    linkedStreamerValue.Value = currentStreamerId
-    roomCodeValue.Value = currentRoomCode
-    sessionKeyValue.Value = currentSessionKey
-    pairUrlValue.Value = BRIDGE_BASE_URL .. "/pair?room=" .. currentRoomCode
-    updateBridgeState("Connected")
-    lastEventValue.Value = "Room " .. currentRoomCode .. " linked to @" .. currentStreamerId
-
-    return true, "Connected"
-end
-
-local function grantCoins(amount)
-    for _, player in ipairs(Players:GetPlayers()) do
-        local leaderstats = player:FindFirstChild("leaderstats")
-        if leaderstats and leaderstats:FindFirstChild("Coins") then
-            leaderstats.Coins.Value += amount
-        end
-    end
-end
-
-local function applySpeedBoost(seconds)
-    for _, player in ipairs(Players:GetPlayers()) do
-        local character = player.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            local originalSpeed = humanoid.WalkSpeed
-            humanoid.WalkSpeed = math.max(originalSpeed, 20)
-            task.delay(seconds, function()
-                if humanoid and humanoid.Parent then
-                    humanoid.WalkSpeed = originalSpeed
-                end
-            end)
-        end
-    end
-end
-
-local function stopRoundInternal(reason)
-    roundLoopToken += 1
-    roundRunningValue.Value = false
-    roundRemainingValue.Value = roundDurationValue.Value
-    if reason and reason ~= "" then
-        lastEventValue.Value = reason
-    end
-end
-
-local function startRoundInternal()
-    roundLoopToken += 1
-    local token = roundLoopToken
-    roundRunningValue.Value = true
-    roundRemainingValue.Value = roundDurationValue.Value
-    lastEventValue.Value = "Round started"
-
-    task.spawn(function()
-        while roundRunningValue.Value and token == roundLoopToken and roundRemainingValue.Value > 0 do
-            task.wait(1)
-            if not roundRunningValue.Value or token ~= roundLoopToken then
-                break
-            end
-            roundRemainingValue.Value -= 1
-        end
-
-        if token ~= roundLoopToken then
-            return
-        end
-
-        if roundRemainingValue.Value <= 0 then
-            roundRunningValue.Value = false
-            roundRemainingValue.Value = 0
-            lastEventValue.Value = "Round ended"
-            pushToast(nil, "Round ended", "info")
-        end
-    end)
-end
-
-local function handleInteraction(event)
-    if not event or not event.type then
-        return
-    end
-
-    local army = _G.ArmyGame
-
-    if event.type == "comment" then
-        local username = tostring(event.username or "TikTokUser")
-        local text = tostring(event.text or "")
-        lastEventValue.Value = string.format("%s commented: %s", username, text)
-        pushToast(nil, lastEventValue.Value, "comment")
-
-        if army and army.ProcessComment then
-            local ok, err = pcall(function()
-                army.ProcessComment(username, text)
-            end)
-            if not ok then
-                warn("Army ProcessComment failed:", err)
-            end
-        end
-
-    elseif event.type == "gift" then
-        local username = tostring(event.username or "TikTokUser")
-        local coinCount = tonumber(event.coinCount) or tonumber(event.repeatCount) or 1
-
-        lastEventValue.Value = string.format("%s sent %s (%d coins)", username, tostring(event.giftName or "Gift"), coinCount)
-        pushToast(nil, lastEventValue.Value, "gift")
-
-        if army and army.ProcessGift then
-            local ok, err = pcall(function()
-                army.ProcessGift(username, coinCount)
-            end)
-            if not ok then
-                warn("Army ProcessGift failed:", err)
-            end
-        end
-
-    elseif event.type == "like" then
-        local username = tostring(event.username or "TikTokUser")
-        local likeCount = tonumber(event.likeCount) or 1
-
-        totalLikesValue.Value += likeCount
-        lastEventValue.Value = string.format("%s sent likes (+%d)", username, likeCount)
-
-        if army and army.ProcessLikes then
-            local ok, err = pcall(function()
-                army.ProcessLikes(username, likeCount)
-            end)
-            if not ok then
-                warn("Army ProcessLikes failed:", err)
-            end
-        end
-
-    elseif event.type == "follow" then
-        local username = tostring(event.username or "TikTokUser")
-        lastEventValue.Value = string.format("%s followed the live", username)
-        pushToast(nil, lastEventValue.Value, "follow")
-
-        if army and army.ProcessFollow then
-            local ok, err = pcall(function()
-                army.ProcessFollow(username)
-            end)
-            if not ok then
-                warn("Army ProcessFollow failed:", err)
-            end
-        end
-
-    elseif event.type == "status" then
-        local state = tostring(event.state or "unknown")
-        updateBridgeState("TikTok " .. state)
-        lastEventValue.Value = "TikTok status: " .. state
-    end
-end
+    return jsonify({"ok": True, "removed": removed is not None})
 
 
-local function pollLoop()
-    while true do
-        if currentSessionKey then
-            local ok, result = pcall(function()
-                return requestJson("/poll", {
-                    sessionKey = currentSessionKey,
-                })
-            end)
+@app.post("/poll")
+def poll():
+    if not require_secret():
+        return jsonify({"ok": False, "message": "unauthorized"}), 401
 
-            if ok and result and result.events then
-                for _, event in ipairs(result.events) do
-                    handleInteraction(event)
-                end
-            elseif not ok then
-                updateBridgeState("Poll failed")
-                warn("Bridge poll failed", result)
-            end
-        end
+    body = request.get_json(silent=True) or {}
+    session_key = str(body.get("sessionKey", ""))
+    with lock:
+        session = sessions.get(session_key)
+        if not session:
+            return jsonify({"ok": False, "message": "session not found"}), 404
 
-        task.wait(POLL_INTERVAL_SECONDS)
-    end
-end
+        q: Deque[dict] = session["queue"]
+        events = list(q)
+        q.clear()
 
-controlFunction.OnServerInvoke = function(player, action, payload)
-    payload = payload or {}
+    if events:
+        log(f"/poll session={session_key[:8]} events={len(events)}")
+    return jsonify({"ok": True, "events": events})
 
-    if action == "getState" then
-        return snapshotState(player)
-    end
 
-    if not canControl(player) then
-        return {
-            ok = false,
-            message = "You are not allowed to control this panel",
-        }
-    end
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "message": "Use /pair or /healthz"})
 
-    if action == "connect" then
-        local ok, message = startSessionForRoom(payload.roomCode)
-        if ok then
-            pushToast(nil, "Linked TikTok @" .. linkedStreamerValue.Value .. " / room " .. roomCodeValue.Value, "success")
-        else
-            pushToast(player, message, "error")
-        end
-        local state = snapshotState(player)
-        state.ok = ok
-        state.message = message
-        return state
-    elseif action == "disconnect" then
-        stopCurrentSession()
-        pushToast(nil, "TikTok disconnected", "info")
-        local state = snapshotState(player)
-        state.message = "Disconnected"
-        return state
-    elseif action == "setRoundDuration" then
-        local seconds = math.floor(tonumber(payload.seconds) or 0)
-        if seconds < 10 or seconds > 3600 then
-            return {
-                ok = false,
-                message = "Round time must be between 10 and 3600 seconds",
-            }
-        end
-        roundDurationValue.Value = seconds
-        if not roundRunningValue.Value then
-            roundRemainingValue.Value = seconds
-        end
-        lastEventValue.Value = "Round time set to " .. seconds .. "s"
-        local state = snapshotState(player)
-        state.message = "Round time updated"
-        return state
-    elseif action == "startRound" then
-        if roundRunningValue.Value then
-            return {
-                ok = false,
-                message = "Round is already running",
-            }
-        end
-        startRoundInternal()
-        local state = snapshotState(player)
-        state.message = "Round started"
-        return state
-    elseif action == "stopRound" then
-        stopRoundInternal("Round stopped")
-        local state = snapshotState(player)
-        state.message = "Round stopped"
-        return state
-    end
 
-    return {
-        ok = false,
-        message = "Unknown action",
-    }
-end
-
-Players.PlayerRemoving:Connect(function(player)
-    if player.UserId == game.PrivateServerOwnerId then
-        -- Keep the room alive; do nothing automatically.
-    end
-end)
-
-task.spawn(pollLoop)
-
-updateBridgeState("Idle")
-
-if RunService:IsStudio() then
-    warn("Remember to enable HTTP Requests in Game Settings > Security")
-end
-
-game:BindToClose(function()
-    stopCurrentSession()
-end)
+if __name__ == "__main__":
+    log(f"starting practical bridge on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
