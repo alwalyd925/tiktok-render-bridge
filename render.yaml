@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tiktok-roblox-roomcode-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bridge_server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: SHARED_SECRET
+        sync: false
