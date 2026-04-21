@@ -80,6 +80,13 @@ def normalize_username(value: str) -> str:
     value = value.lstrip("@")
     return value
 
+
+
+def render_pair_html(message_block: str, room: str, username: str) -> str:
+    return (PAIR_HTML
+        .replace("{message_block}", message_block)
+        .replace("{room}", room)
+        .replace("{username}", username))
 def broadcast(streamer_id: str, event: Dict[str, Any]):
     with lock:
         delivered = 0
@@ -272,7 +279,7 @@ def healthz():
 def pair():
     if request.method == "GET":
         room = normalize_room(request.args.get("room", ""))
-        html = PAIR_HTML.format(message_block="", room=room, username="")
+        html = render_pair_html("", room, "")
         return Response(html, mimetype="text/html")
 
     room = normalize_room(request.form.get("room", ""))
@@ -280,7 +287,7 @@ def pair():
 
     if not room or not username:
         msg = '<div class="err">Room code and TikTok username are required.</div>'
-        return Response(PAIR_HTML.format(message_block=msg, room=room, username=username), mimetype="text/html")
+        return Response(render_pair_html(msg, room, username), mimetype="text/html")
 
     with lock:
         pairings[room] = {
@@ -290,7 +297,7 @@ def pair():
 
     log(f"PAIR room={room} -> @{username}")
     msg = f'<div class="ok">Room {room} is now paired to @{username}. Go back to Roblox and press Connect.</div>'
-    return Response(PAIR_HTML.format(message_block=msg, room=room, username=username), mimetype="text/html")
+    return Response(render_pair_html(msg, room, username), mimetype="text/html")
 
 @app.post("/session/start")
 def session_start():
