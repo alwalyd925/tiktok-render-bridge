@@ -373,4 +373,4 @@ def poll():
 
 if __name__ == "__main__":
     log(f"starting debug bridge on port {PORT}")
-    app.run(host="0.0.0.0", 
+    app.run(host="0.0.0.0", port=PORT)
