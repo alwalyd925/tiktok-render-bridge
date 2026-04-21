@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import threading
+import re
 from collections import deque
 from typing import Dict, Deque, Any
 
@@ -372,4 +373,4 @@ def poll():
 
 if __name__ == "__main__":
     log(f"starting debug bridge on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", 
